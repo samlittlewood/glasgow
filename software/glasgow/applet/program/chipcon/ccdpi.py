@@ -6,6 +6,8 @@
 #
 # TBD: CC2530/1/3, CC2540/1
 #
+# Tested: CC2511F32 rev. 3
+#
 # XXX move the guts of read/write loops into target state machine
 # XXX flash timer register (FTW)  - setup in clock_init()
 # XXX f8 parts - write half page at a time

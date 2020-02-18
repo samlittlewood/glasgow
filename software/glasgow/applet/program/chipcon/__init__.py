@@ -74,34 +74,59 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
     @classmethod
     def add_interact_arguments(cls, parser):
 
+        def address(arg):
+            return int(arg, 0)
+
+        def length(arg):
+            return int(arg, 0)
+        
         p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION")
 
         p_identify = p_operation.add_parser(
             "identify", help="read identity and revision from connected device")
 
-        p_identify = p_operation.add_parser(
+        p_status = p_operation.add_parser(
             "status", help="read status of device")
-        
+
+        p_erase = p_operation.add_parser(
+            "erase", help="erase whole device.")
+
+        p_erase_page = p_operation.add_parser(
+            "erase-page", help="erase whole device.")
+
+        p_erase_page.add_argument(
+            "address", metavar="ADDRESS", type=address,
+            help="erase memory from address ADDRESS")
+
         p_read = p_operation.add_parser(
-            "read", help="read flash memorys")
+            "read", help="read memory")
         p_read.add_argument(
-            "--file", metavar="FILE", type=argparse.FileType("wb"),
-            help="write memory contents to FILE")
+            "address", metavar="ADDRESS", type=address,
+            help="read memory from address ADDRESS")
+        p_read.add_argument(
+            "length", metavar="LENGTH", type=length,
+            help="read LENGTH bytes from memory")
+        p_read.add_argument(
+            "--code", metavar="CODE", type=argparse.FileType("wb"),
+            help="read memory contents into CODE")
+        p_read.add_argument(
+            "--lock-bits", metavar="LOCK-BITS", type=argparse.FileType("wb"),
+            help="read flash information page into LOCK-BITS")
 
         p_write = p_operation.add_parser(
-            "write", help="write and verify device flash memory")
-
+            "write", help="write and verify memory")
         p_write.add_argument(
-            "--file", metavar="FILE", type=argparse.FileType("rb"),
-            help="read program memory contents from FILE")
-
-        p_write_lock = p_operation.add_parser(
-            "write-lock", help="set flash lock bits")
-
-        p_read_lock = p_operation.add_parser(
-            "read-lock", help="display flash lock bits")
-
-    
+            "--code", metavar="CODE", type=argparse.FileType("rb"),
+            help="program code memory contents from CODE")
+        p_write.add_argument(
+            "--lock-bits", metavar="LOCK-BITS", type=argparse.FileType("rb"),
+            help="program flash information page from LOCK-BITS")
+        p_write.add_argument(
+            "--no-erase", action="store_true",
+            help="do not erase chip before writing")
+        p_write.add_argument(
+            "--offset", metavar="OFFSET", type=address, default=0,
+            help="adjust memory addresses by OFFSET")
 
     @staticmethod
     def _check_format(file, kind):
@@ -113,57 +138,85 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
     async def report_status(self, chipcon_iface):
         s = await chipcon_iface.get_status()
         ss = list(x for i,x in enumerate(STATUS_BITS) if ((0x80 >> i) & s) != 0)
-        print("Status: 0x{:02x} [{}]".format(s, ", ".join(ss)))
+        self.logger.info("Status: 0x{:02x} [{}]".format(s, ", ".join(ss)))
 
     async def interact(self, device, args, chipcon_iface):
 
-        self.logger.info(args.operation)
-            
-        if args.operation == "status":
-            await chipcon_iface.connect()
-            await self.report_status(chipcon_iface)
-
-        if args.operation == "read":
-            if args.file:
-                self._check_format(args.file, "flash")
-                self.logger.info("reading memory (%d bytes)", device.program_size)
-                output_data(args.program,
-                    await chipcon_iface.read_code(range(device.program_size)))
-
-        if args.operation == "write":
-            await chipcon_iface.connect()
-
-#            self.logger.info("erasing chip")
-#            await chipcon_iface.chip_erase()
-
-            self._check_format(args.file, "flash")
-            data = input_data(args.file)
-            self.logger.info("writing program memory (%d bytes)",
-                             sum([len(chunk) for address, chunk in data]))
-            for address, chunk in data:
-                chunk = bytes(chunk)
-                print(address, chunk)
-#                await chipcon_iface.write_flash_memory_range(address, chunk, device.program_page)
-#                written = await avr_iface.read_flash_memory_range(range(address, len(chunk)))
-#                if written != chunk:
-#                    raise GlasgowAppletError("verification failed at address %#06x: %s != %s" %
-#                                             (address, written.hex(), chunk.hex()))
-    
-        if args.operation == "read-lock":
-            pass
-
-        if args.operation == "write-lock":
-            pass
+        await chipcon_iface.connect()
+        await chipcon_iface.clock_init()
         
+        self.logger.info("connected to {} Rev:{}".format(
+			chipcon_iface.device.name,
+			chipcon_iface.chip_rev))
+        self.logger.info(args.operation)
+
         if args.operation == "identify":
-            await chipcon_iface.connect()
-            id,rev = await chipcon_iface.get_chip_id()
-            if id in DEVICES:
-                name = DEVICES[id]["name"]
-            else:
-                name = "Unknown"
             # XXX test SRAM to figure out F8/F16/F32 parts
-            print("Id:{:X} [{}] Rev:{:d}".format(id, name, rev))
+            self.logger.info("Id:{:X} [{}] Rev:{:d}".format(
+				chipcon_iface.chip_id,
+				chipcon_iface.device.name,
+				chipcon_iface.chip_rev))
+
+        elif args.operation == "status":
+            await self.report_status(chipcon_iface)
+            
+        elif args.operation == "erase":
+            await chipcon_iface.chip_erase()
+            
+        elif args.operation == "erase-page":
+            await chipcon_iface.erase_flash_page(args,address)
+            
+        elif args.operation == "read":
+            if args.code:
+                self._check_format(args.code, "code")
+                self.logger.info("reading code (%d bytes)", args.length)
+                output_data(args.code,
+                            await chipcon_iface.read_code(args.address, args.length))
+
+            if args.lock_bits:
+                self._check_format(args.lock_bits, "lock-bits")
+                self.logger.info("reading flash information (%d bytes)", args.length)
+                await chipcon_iface.set_config(1) # CONFIG_SEL_FLASH_INFO_PAGE
+                output_data(args.lock_bits,
+                            await chipcon_iface.read_code(args.address, args.length))
+                await chipcon_iface.set_config(0)
+                            
+        elif args.operation == "write":
+            if not args.no_erase:
+                self.logger.info("erasing chip")
+                await chipcon_iface.chip_erase()
+
+            if args.code:
+                self._check_format(args.code, "code")
+                data = input_data(args.code)
+                self.logger.info("writing code (%d bytes)",
+                                 sum([len(chunk) for address, chunk in data]))
+                for address, chunk in data:
+                    chunk = bytes(chunk)
+                    await chipcon_iface.write_flash(address, chunk)
+                    readback = await chipcon_iface.read_code(address, len(chunk))
+
+                    if chunk != readback:
+                        raise GlasgowAppletError(
+                            "verification failed at address %#06x: %s != %s" %
+                            (address, written.hex(), chunk.hex()))
+
+            if args.lock_bits:
+                self._check_format(args.lock_bits, "lock-bits")
+                data = input_data(args.lock_bits)
+                self.logger.info("writing flash information (%d bytes)",
+                                 sum([len(chunk) for address, chunk in data]))
+                for address, chunk in data:
+                    chunk = bytes(chunk)
+                    await chipcon_iface.set_config(1) # CONFIG_SEL_FLASH_INFO_PAGE
+                    await chipcon_iface.write_flash(address + args.offset, chunk)
+                    readback = await chipcon_iface.read_code(address + args.offset, len(chunk))
+                    await chipcon_iface.set_config(0)
+
+                    if chunk != readback:
+                        raise GlasgowAppletError(
+                            "verification failed at address %#06x: %s != %s" %
+                            (address, written.hex(), chunk.hex()))
 
 # -------------------------------------------------------------------------------------------------
 
