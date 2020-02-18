@@ -27,7 +27,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
     description = """
     TBD
 
-    CC111-24510DDK P3 Debug:
+    CC111-2511DDK P3 Debug:
 
     1 GND    2 VDD
     3 DCLK   4 DDAT
@@ -35,7 +35,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
     7 RESETN 8
     9        10
     """
-    
+
     __pins = ( "dclk", "ddat", "resetn")
 
     @classmethod
@@ -65,7 +65,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
             iface.pads.resetn_t.oe.eq(1),
             iface.pads.resetn_t.o.eq(~reset)
         ]
-        
+
     async def run(self, device, args):
         iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args)
         chipcon_iface = CCDPIInterface(iface, self.logger, self._addr_reset)
@@ -217,6 +217,8 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
                         raise GlasgowAppletError(
                             "verification failed at address %#06x: %s != %s" %
                             (address, written.hex(), chunk.hex()))
+
+        await chipcon_iface.disconnect()
 
 # -------------------------------------------------------------------------------------------------
 

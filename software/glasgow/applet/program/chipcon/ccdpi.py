@@ -205,7 +205,8 @@ class CCDPISubtarget(Elaboratable):
         m = Module()
         m.submodules.bus = bus = CCDPIBus(self.pads, self.period)
 
-        op = Signal(2)
+        discard = Signal()
+        op = Signal()
         count_out = Signal(3)
         count_in = Signal(3)
         
@@ -217,7 +218,7 @@ class CCDPISubtarget(Elaboratable):
                 m.d.comb += led_ready.eq(1)
                 with m.If(self.out_fifo.readable):
                     m.d.comb += self.out_fifo.re.eq(1)
-                    m.d.sync += Cat(count_in, count_out, op).eq(self.out_fifo.dout)
+                    m.d.sync += Cat(count_in, count_out, op, discard).eq(self.out_fifo.dout)
                     m.next = "START"
 
             with m.State("START"):
@@ -226,8 +227,6 @@ class CCDPISubtarget(Elaboratable):
                         m.next = "OUT"
                     with m.Case(OP_DEBUG):
                         m.next = "DEBUG"
-                    with m.Case():
-                        m.next = "READY"
 
             with m.State("OUT"):
                 with m.If(count_out == 0):
@@ -258,7 +257,7 @@ class CCDPISubtarget(Elaboratable):
             with m.State("IN_WRITE"):
                 with m.If(bus.rdy & self.in_fifo.writable):
                     m.d.comb += [
-                        self.in_fifo.we.eq(1),
+                        self.in_fifo.we.eq(~discard),
                         self.in_fifo.din.eq(bus.di),
                     ]
 
@@ -292,7 +291,11 @@ class CCDPIInterface:
     def _log(self, message, *args):
         self._logger.log(self._level, "CCDPI: " + message, *args)
 
-    async def _send_recv(self, op, out_bytes, num_bytes_in):
+    async def _send_recv(self, op, out_bytes, num_bytes_in, discard=False):
+        """Send operation code then output bytes to fifo.
+        Read back input bytes.
+        TBD: disard is ignored atm
+        """
         if not self.connected:
             raise CCDPIError("not connected")
             
@@ -358,10 +361,10 @@ class CCDPIInterface:
         return r[0]
 
     async def halt(self):
-        await self._send_recv(OP_COMMAND, [CMD_HALT], 1)
+        await self._send_recv(OP_COMMAND, [CMD_HALT], 1, discard=True)
     
     async def resume(self):
-        await self._send_recv(OP_COMMAND, [CMD_RESUME], 1)
+        await self._send_recv(OP_COMMAND, [CMD_RESUME], 1, discard=True)
 
     async def step(self):
         r = await self._send_recv(OP_COMMAND, [CMD_STEP_INSTR], 1)
@@ -376,22 +379,27 @@ class CCDPIInterface:
         return r[0]
 
     async def set_config(self, cfg):
-        await self._send_recv(OP_COMMAND, [CMD_WR_CONFIG, cfg], 1)
+        await self._send_recv(OP_COMMAND, [CMD_WR_CONFIG, cfg], 1, discard=True)
 
     async def set_breakpoint(self, bp, bank, address, enable=True):
         await self._send_recv(OP_COMMAND, [CMD_SET_HW_BRKPNT,
                                            (bp << 4)+(0x4 if enable else 0) + bank,
-                                           (address>>8) & 0xff, address & 0xff], 1)
+                                           (address>>8) & 0xff, address & 0xff], 1, discard=True)
 
     async def clear_breakpoint(self, bp):
-        await self._send_recv(OP_COMMAND, [CMD_SET_HW_BRKPNT, (bp << 4) + 0x00, 0x00, 0x00], 1)
+        await self._send_recv(OP_COMMAND, [CMD_SET_HW_BRKPNT, (bp << 4) + 0x00, 0x00, 0x00], 1, discard=True)
 
     async def debug_instr(self, *args):
         if not 1 <= len(args) <= 3:
             raise CCDPIError("Instructions must be 1..3 bytes")
+        await self._send_recv(OP_COMMAND, [CMD_DEBUG_INSTR + len(args)] + list(args), 1, discard=True)
+
+    async def debug_instr_a(self, *args):
+        if not 1 <= len(args) <= 3:
+            raise CCDPIError("Instructions must be 1..3 bytes")
         r = await self._send_recv(OP_COMMAND, [CMD_DEBUG_INSTR + len(args)] + list(args), 1)
         return r[0]
-
+    
     async def set_pc(self, address):
         await self.debug_instr(0x02, (address >> 8) & 0xff, address & 0xff) # LJMP address
 
@@ -414,7 +422,7 @@ class CCDPIInterface:
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
         for n in range(count):
             await self.debug_instr(0xE4)                                    #   CLR A
-            data.append(await self.debug_instr(0x93))                       #   MOVC A, @A+DPTR
+            data.append(await self.debug_instr_a(0x93))                     #   MOVC A, @A+DPTR
             await self.debug_instr(0xA3)                                    #   INC DPTR
         return data
     
@@ -424,7 +432,7 @@ class CCDPIInterface:
         data = bytearray()
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
         for n in range(count):
-            data.append(await self.debug_instr(0xE0))                       #   MOVX A, @DPTR
+            data.append(await self.debug_instr_a(0xE0))                     #   MOVX A, @DPTR
             await self.debug_instr(0xA3)                                    #   INC DPTR
         return data
 
@@ -443,17 +451,17 @@ class CCDPIInterface:
             clkcon = 0xc1
         else:
             clkcon = 0x80
-	
+    
         await self.debug_instr(0x75, 0xC6, clkcon)                          # MOV CLKCON,#imm8
         for c in range(50):
-            if await self.debug_instr(0xE5, 0xBE) & 0x40:                   #   MOV A, SLEEP
+            if await self.debug_instr_a(0xE5, 0xBE) & 0x40:                 #   MOV A, SLEEP
                 break
         else:
             raise CCDPIError("High speed clock not stable")
 
     async def erase_flash_page(self, address):
         """Erase one page of flash memory."""
-		
+        
         if (address % self.device.flash_page_size) != 0:
             raise CCDPIError("Address is not page aligned")
 
@@ -463,7 +471,7 @@ class CCDPIInterface:
         await self.debug_instr(0x75, 0xAC, 0)                               # MOV FADDRH, #0
         await self.debug_instr(0x75, 0xAE, 0x01)                            # MOV FLC, #01h ; ERASE
         for c in range(50):
-            if not await self.debug_instr(0xE5, 0xAE) & 0x80:               # MOV A, FLC
+            if not await self.debug_instr_r(0xE5, 0xAE) & 0x80:               # MOV A, FLC
                 break
         else:
             raise CCDPIError("Cannot erase flash page") 
@@ -476,12 +484,12 @@ class CCDPIInterface:
         # Word align start and end of data by padding with 0xff
         start_pad = address % self.device.flash_word_size
         if start_pad != 0:
-            data = [0xff]*start_pad + data
+            data = bytes([0xff]*start_pad) + data
             address -= start_pad
 
         end_pad = len(data) % self.device.flash_word_size
         if end_pad != 0:
-            data =  data + [0xff]*(self.device.flash_word_size-end_pad)
+            data =  data + bytes([0xff]*(self.device.flash_word_size-end_pad))
 
         if len(data) > self.device.flash_page_size:
             raise CCDPIError("Trying to write more than a page of data to flash.")
