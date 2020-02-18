@@ -1,0 +1,500 @@
+# Chipcon Debug and Programming Interface
+#
+# Supports: CC1110, CC1111, CC2510, CC2511, CC2430, CC2431
+#
+# From: "CC1110/ CC2430/ CC2510 Debug and Programming Interface Specification Rev. 1.2"
+#
+# TBD: CC2530/1/3, CC2540/1
+#
+# 
+import logging
+import asyncio
+
+from nmigen import *
+from ... import GlasgowAppletError
+
+DEVICES = {
+    0x01: {"name":"CC1110", "flash_word_size":2, "flash_page_size":1024},
+    0x11: {"name":"CC1111", "flash_word_size":2, "flash_page_size":1024},
+    0x81: {"name":"CC2510", "flash_word_size":2, "flash_page_size":1024},
+    0x91: {"name":"CC2511", "flash_word_size":2, "flash_page_size":1024},
+    0x85: {"name":"CC2430", "flash_word_size":4, "flash_page_size":2048},
+    0x89: {"name":"CC2431", "flash_word_size":4, "flash_page_size":2048},
+}
+
+class CCDPIError(GlasgowAppletError):
+    pass
+
+class CCDPIBus(Elaboratable):
+    """Bus interface - byte<->serial."""
+
+    def __init__(self, pads, period):
+        self.pads = pads
+        self.half_period = period//2
+        
+        self.di  = Signal(8)
+        self.do  = Signal(8)
+        self.bits = Signal(range(8))
+        self.w   = Signal()
+        self.ack = Signal()
+        self.rdy = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        dclk = Signal()
+        oe   = Signal()
+        o    = Signal()
+        i    = Signal()
+
+        led_ready = platform.request("led",0)
+        
+        m.d.comb += [
+            self.pads.dclk_t.oe.eq(1),
+            self.pads.dclk_t.o.eq(dclk),
+
+            self.pads.ddat_t.oe.eq(oe),
+            self.pads.ddat_t.o.eq(o),
+
+            i.eq(self.pads.ddat_t.i),
+        ]
+
+        # Strobe every half-period
+        timer    = Signal(range(self.half_period))
+        stb      = Signal()
+
+        with m.If(timer == 0):
+            m.d.sync += timer.eq(self.half_period - 1),
+        with m.Else():
+            m.d.sync += timer.eq(timer - 1),
+
+        m.d.comb += stb.eq(timer == 0)
+        
+        d   = Signal(8)
+        cnt = Signal(range(8))
+
+        m.d.comb += self.di.eq(d)
+        
+        with m.FSM(reset='READY') as fsm:
+            with m.State("READY"):
+                m.d.comb += [
+                    self.rdy.eq(1),
+                    led_ready.eq(1),
+                ]
+                
+                with m.If(self.ack): 
+                    m.d.sync += cnt.eq(self.bits)
+                    with m.If(self.w):
+                        m.d.sync += d.eq(self.do)
+                        m.d.sync += oe.eq(1),
+                        m.next = "WRITE_RISE"
+                    with m.Else():
+                        m.d.sync += oe.eq(0),
+                        m.next = "READ_RISE"
+
+            with m.State("WRITE_RISE"):
+                with m.If(stb):
+                    m.d.sync += [
+                        o.eq(d[-1]),
+                        dclk.eq(1),
+                        cnt.eq(cnt-1),
+                    ]
+                    m.next = "WRITE_FALL"
+
+            with m.State("WRITE_FALL"):
+                with m.If(stb):
+                    m.d.sync += [
+                        d[1:].eq(d),
+                        dclk.eq(0),
+                    ]
+                    with m.If(cnt == 0):
+                        m.next = "DONE"
+                    with m.Else():
+                        m.next = "WRITE_RISE"
+                    
+            with m.State("READ_RISE"):
+                with m.If(stb):
+                    m.d.sync += [
+                        dclk.eq(1),
+                        cnt.eq(cnt-1),
+                    ]
+                    m.next = "READ_FALL"
+
+            with m.State("READ_FALL"):
+                with m.If(stb):
+                    m.d.sync += [
+                        d.eq(Cat(i, d[0:-1])),
+                        dclk.eq(0),
+                    ]
+                    with m.If(cnt == 0):
+                        m.next = "DONE"
+                    with m.Else():
+                        m.next = "READ_RISE"
+
+                       
+            with m.State("DONE"):
+                with m.If(stb):
+                    m.d.sync += oe.eq(0)
+                    m.next = "READY"
+                
+        return m
+
+# Interface operations
+OP_COMMAND = 0
+OP_DEBUG   = 1
+
+# Device debug commands
+#
+#  There seems to have been an intention to encode bytes out/in in low nibble,
+#  but there are enought special cases to make it unusable
+#
+CMD_CHIP_ERASE    = 0b0001_0100
+CMD_WR_CONFIG     = 0b0001_1101
+CMD_RD_CONFIG     = 0b0010_0100
+CMD_GET_PC        = 0b0010_1000
+CMD_READ_STATUS   = 0b0011_0100
+CMD_SET_HW_BRKPNT = 0b0011_1111
+CMD_HALT          = 0b0100_0100
+CMD_RESUME        = 0b0100_1100
+CMD_DEBUG_INSTR   = 0b0101_0100
+CMD_DEBUG_INSTR1  = 0b0101_0101
+CMD_DEBUG_INSTR2  = 0b0101_0110
+CMD_DEBUG_INSTR3  = 0b0101_0111
+CMD_STEP_INSTR    = 0b0101_1100
+CMD_STEP_REPLACE  = 0b0110_0100
+CMD_GET_CHIP_ID   = 0b0110_1000
+
+# Config register bits
+#
+CONFIG_TIMERS_OFF          = 0b0000_1000
+CONFIG_DMA_PAUSE           = 0b0000_0100
+CONFIG_TIMER_SUSPEND       = 0b0000_0010
+CONFIG_SEL_FLASH_INFO_PAGE = 0b0000_0001
+
+# Status register bits
+#
+STATUS_CHIP_ERASE_DONE   = 0b1000_0000
+STATUS_PCON_IDLE         = 0b0100_0000
+STATUS_CPU_HALTED        = 0b0010_0000
+STATUS_POWER_MODE_0      = 0b0001_0000
+STATUS_HALT_STATUS       = 0b0000_1000
+STATUS_DEBUG_LOCKED      = 0b0000_0100
+STATUS_OSCILLATOR_STABLE = 0b0000_0010
+STATUS_STACK_OVERFLOW    = 0b0000_0001
+
+class CCDPISubtarget(Elaboratable):
+    def __init__(self, pads, out_fifo, in_fifo, period):
+        self.pads = pads
+        self.out_fifo = out_fifo
+        self.in_fifo = in_fifo
+        self.period = period
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.bus = bus = CCDPIBus(self.pads, self.period)
+
+        # XXX record?
+        op = Signal(2)
+        count_out = Signal(3)
+        count_in = Signal(3)
+        
+        led_ready = platform.request("led",1)
+        led_busy = platform.request("led",2)
+
+        with m.FSM():
+            with m.State("READY"):
+                m.d.comb += self.in_fifo.flush.eq(1)
+                m.d.comb += led_ready.eq(1)
+                with m.If(self.out_fifo.readable):
+                    m.d.comb += self.out_fifo.re.eq(1)
+                    m.d.sync += Cat(count_in, count_out, op).eq(self.out_fifo.dout)
+                    m.next = "START"
+
+            with m.State("START"):
+                with m.Switch(op):
+                    with m.Case(OP_COMMAND):
+                        m.next = "OUT"
+                    with m.Case(OP_DEBUG):
+                        m.next = "DEBUG"
+                    with m.Case():
+                        m.next = "READY"
+
+            with m.State("OUT"):
+                with m.If(count_out == 0):
+                    m.next = "IN"
+
+                with m.Elif(bus.rdy & self.out_fifo.readable):
+                    m.d.comb += [
+                        self.out_fifo.re.eq(1),
+                        bus.do.eq(self.out_fifo.dout),
+                        bus.w.eq(1),
+                        bus.bits.eq(8),
+                        bus.ack.eq(1),
+                    ]
+
+                    m.d.sync += count_out.eq(count_out-1)
+                    
+            with m.State("IN"):
+                with m.If(count_in == 0):
+                    m.next = "DONE"
+                with m.Elif(bus.rdy):
+                    m.d.comb += [
+                        bus.w.eq(0),
+                        bus.bits.eq(8),
+                        bus.ack.eq(1),
+                    ]
+                    m.next = "IN_WRITE"
+    
+            with m.State("IN_WRITE"):
+                with m.If(bus.rdy & self.in_fifo.writable):
+                    m.d.comb += [
+                        self.in_fifo.we.eq(1),
+                        self.in_fifo.din.eq(bus.di),
+                    ]
+
+                    m.d.sync += count_in.eq(count_in-1)
+                    m.next = "IN"
+                    
+            with m.State("DEBUG"):
+                with m.If(bus.rdy):
+                    m.d.comb += [
+                        self.out_fifo.re.eq(1),
+                        bus.do.eq(0),
+                        bus.w.eq(0),
+                        bus.bits.eq(2),
+                        bus.ack.eq(1),
+                    ]
+                    m.next = "READY"
+                    
+            with m.State("DONE"):
+                m.next = "READY"
+
+        return m
+
+class CCDPIInterface:
+    def __init__(self, interface, logger, addr_reset):
+        self.lower   = interface
+        self._logger = logger
+        self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
+        self._addr_reset = addr_reset
+
+        self.connected = False
+        self.chip_id = 0
+        self.chip_rev = 0
+        
+    def _log(self, message, *args):
+        self._logger.log(self._level, "CCDPI: " + message, *args)
+
+    async def _send_recv(self, op, out_bytes, num_bytes_in):
+        if not self.connected:
+            raise CCDPIError("not connected")
+            
+        start_code = (op << 6) + (len(out_bytes) << 3) + num_bytes_in;
+        await self.lower.write([start_code] + out_bytes)
+        return await self.lower.read(num_bytes_in)
+    
+    async def connect(self):
+        """If not already connected, reset device into debug mode."""
+        if self.connected:
+            return
+        self.connected = True
+
+        await self.lower.reset()
+
+        # XXX implement precise delay in target
+        await asyncio.sleep(0.01)
+        await self.lower.device.write_register(self._addr_reset, 1)
+        await asyncio.sleep(0.01)
+        r = await self._send_recv(OP_DEBUG, [], 0)
+        await asyncio.sleep(0.01)
+        await self.lower.device.write_register(self._addr_reset, 0)
+
+        # Is there something recognizable attached?
+        self.chip_id,self.chip_rev = await self.get_chip_id()
+        if self.chip_id in DEVICES:
+            self.flash_word_size = DEVICES[self.chip_id]["flash_word_size"]
+            self.flash_page_size = DEVICES[self.chip_id]["flash_page_size"]
+        else:
+            raise CCDPIError("Did not find device")
+
+        # Wait for stable clock
+        for c in range(100): # XXX pooma
+            if await self.get_status() & STATUS_OSCILLATOR_STABLE:
+                break
+        else:
+            raise CCDPIError("Oscillator not stable")
+
+        await self.halt()
+        
+    async def disconnect(self):
+        """If connected, reset device into normal operation."""
+        if not self.connected:
+            return
+        self.connected = False
+        
+        await asyncio.sleep(0.01)
+        await self.lower.device.write_register(self._addr_reset, 1)
+        await asyncio.sleep(0.01)
+        await self.lower.device.write_register(self._addr_reset, 0)
+
+    async def get_chip_id(self):
+        id,rev = await self._send_recv(OP_COMMAND, [CMD_GET_CHIP_ID], 2)
+        return (id, rev)
+
+    async def chip_erase(self):
+        id,rev = await self._send_recv(OP_COMMAND, [CMD_CHIP_ERASE], 1)
+        for c in range(1000): # XXX pooma
+            if await self.get_status() & STATUS_CHIP_ERASE_DONE:
+                break
+        else:
+            raise CCDPIError("Chip erase not done")
+        
+    async def get_status(self):
+        r = await self._send_recv(OP_COMMAND, [CMD_READ_STATUS], 1)
+        return r[0]
+
+    async def halt(self):
+        await self._send_recv(OP_COMMAND, [CMD_HALT], 1)
+    
+    async def resume(self):
+        await self._send_recv(OP_COMMAND, [CMD_RESUME], 1)
+
+    async def step(self):
+        r = await self._send_recv(OP_COMMAND, [CMD_STEP_INSTR], 1)
+        return r[0]
+
+    async def get_pc(self):
+        r = await self._send_recv(OP_COMMAND, [CMD_GET_PC], 2)
+        return (r[0] << 8) + r[1]
+    
+    async def get_config(self):
+        r = await self._send_recv(OP_COMMAND, [CMD_RD_CONFIG], 1)
+        return r[0]
+
+    async def set_config(self, cfg):
+        await self._send_recv(OP_COMMAND, [CMD_WR_CONFIG, cfg], 1)
+
+    async def set_breakpoint(self, bp, bank, address, enable=True):
+        await self._send_recv(OP_COMMAND, [CMD_SET_HW_BRKPNT,
+                                           (bp << 4)+(0x4 if enable else 0) + bank,
+                                           (address>>8) & 0xff, address & 0xff], 1)
+
+    async def clear_breakpoint(self, bp):
+        await self._send_recv(OP_COMMAND, [CMD_SET_HW_BRKPNT, (bp << 4) + 0x00, 0x00, 0x00], 1)
+
+    async def debug_instr(self, *args):
+        if not 1 <= len(args) <= 3:
+            raise CCDPIError("Instructions must be 1..3 bytes")
+        r = await self._send_recv(OP_COMMAND, [CMD_DEBUG_INSTR + len(args)] + list(args), 1)
+        return r[0]
+
+    async def set_pc(self, address):
+        await self.debug_instr(0x02, (address >> 8) & 0xff, address & 0xff) # LJMP address
+
+    async def read_code(self, linear_address, count):
+        """Read from CODE address space.
+        """
+		if (linear_address // 0x8000) != ((linear_address+count-1) // 0x8000):
+			raise CCDPIError("reading across a bank boundary")
+		
+		if linear_address < 0x8000:
+			bank = 0
+			address = linear_address
+		else:
+			# CC2430 banking
+			bank = linear_address // 0x8000
+			address = (linear_address % 0x8000) + 0x8000
+			
+        # xxx move the guts of this into target state machine
+        data = bytearray()
+        await self.debug_instr(0x75, 0xC7, (bank * 16) + 1)                 # MOV MEMCTR, (bank * 16) + 1
+        await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
+        for n in range(count):
+            await self.debug_instr(0xE4)                                    #   CLR A
+            data.append(await self.debug_instr(0x93))                       #   MOVC A, @A+DPTR
+            await self.debug_instr(0xA3)                                    #   INC DPTR
+        return data
+    
+    async def read_xdata(self, address, count):
+        """Read from XDATA address space.
+        """
+        # xxx move the guts of this into target state machine
+        data = bytearray()
+        await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
+        for n in range(count):
+            data.append(await self.debug_instr(0xE0))                       #   MOVX A, @DPTR
+            await self.debug_instr(0xA3)                                    #   INC DPTR
+        return data
+
+    async def write_xdata(self, address, data):
+        """Write to XDATA address space.
+        """
+        # xxx move the guts of this into target state machine
+        await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
+        for b in data:
+            await self.debug_instr(0x74, b)                                 #   MOV A,#byte
+            await self.debug_instr(0xF0)                                    #   MOV @DPTR,A
+            await self.debug_instr(0xA3)                                    #   INC DPTR
+
+    async def clock_init(self, internal=False):
+        """Set up high speed clock (24Mhz Xtal or 12Mhz internal RC). """
+        if internal:
+            clkcon = 0xc1
+        else:
+            clkcon = 0x80
+
+        await self.debug_instr(0x75, 0xC6, clkcon)                          # MOV CLKCON,#0
+        for w in range(10):
+            s = await self.debug_instr(0xE5, 0xBE)                          #   MOV A, SLEEP
+            if s & 0x40:
+                break
+        else:
+            raise CCDPIError("High speed clock not stable")
+
+    async def write_flash_page(address, data, erase=False):
+		# XXX 2430 set unified code
+        # XXX flash timer register
+		
+		words_per_flash_page = self.flash_page_size // self.flash_word_size
+
+		if len(data) > self.flash_page_size:
+			raise CCDPIError("More than a page of data")
+
+		if (address % self.flash_page_size) != 0:
+			raise CCDPIError("Address is not page aligned")
+		
+		
+        routine = [
+            0x75, 0xAD, ((address >> 8) // self.flash_word_size) & 0x7E,    # MOV FADDRH, #imm
+            0x75, 0xAC, 0x00,                                               # MOV FADDRL, #00
+        ]
+        if erase:
+            routine += [
+                0x75, 0xAE, 0x01,                                           # MOV FLC, #01H ; ERASE
+                                                                            # ; Wait for flash erase to complete
+                0xE5, 0xAE,                                                 # eraseWaitLoop: MOV A, FLC
+                0x20, 0xE7, 0xFB,                                           #   JB ACC_BUSY, eraseWaitLoop
+            ]
+
+        routine += [
+                                                                            # ; Initialize the data pointer
+            0x90, 0xF0, 0x00,                                               # MOV DPTR, #0F000H
+                                                                            # ; Outer loop
+            0x7F, (words_per_flash_page >> 8) & 0xff,                       # MOV R7, #imm
+            0x7E, 0x00,                                                     # MOV R6, #0
+            0x75, 0xAE, 0x02,                                               # MOV FLC, #02H ; WRITE
+                                                                            # ; Inner loops
+            0x7D, flash_word_size,                                          # writeLoop: MOV R5, #imm
+            0xE0,                                                           #   writeWordLoop: MOVX A, @DPTR
+            0xA3,                                                           #     INC DPTR
+            0xF5, 0xAF,                                                     #     MOV FWDATA, A
+            0xDD, 0xFA,                                                     #     DJNZ R5, writeWordLoop
+                                                                            #   ; Wait for completion
+            0xE5, 0xAE,                                                     #   writeWaitLoop: MOV A, FLC
+            0x20, 0XE6, 0xFB,                                               #   JB ACC_SWBSY, writeWaitLoop
+            0xDE, 0xF1,                                                     # DJNZ R6, writeLoop
+            0xDF, 0xEF,                                                     # DJNZ R7, writeLoop
+            0xA5                                                            # BREAK
+        ]
+
+        # 
