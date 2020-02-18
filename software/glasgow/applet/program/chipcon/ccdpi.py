@@ -6,12 +6,19 @@
 #
 # TBD: CC2530/1/3, CC2540/1
 #
+# XXX implement precise delay in target
+# XXX  move the guts of read/write loops into target state machine
+# XXX flash timer register - setup in clock_init()
+# XXX F8 parts - half page at a time
+# XXX CC2430: set unified code map
 # 
 import logging
 import asyncio
 
 from nmigen import *
 from ... import GlasgowAppletError
+
+from fx2.format import autodetect, input_data, output_data, flatten_data
 
 DEVICES = {
     0x01: {"name":"CC1110", "flash_word_size":2, "flash_page_size":1024},
@@ -193,7 +200,6 @@ class CCDPISubtarget(Elaboratable):
         m = Module()
         m.submodules.bus = bus = CCDPIBus(self.pads, self.period)
 
-        # XXX record?
         op = Signal(2)
         count_out = Signal(3)
         count_in = Signal(3)
@@ -301,7 +307,6 @@ class CCDPIInterface:
 
         await self.lower.reset()
 
-        # XXX implement precise delay in target
         await asyncio.sleep(0.01)
         await self.lower.device.write_register(self._addr_reset, 1)
         await asyncio.sleep(0.01)
@@ -318,7 +323,7 @@ class CCDPIInterface:
             raise CCDPIError("Did not find device")
 
         # Wait for stable clock
-        for c in range(100): # XXX pooma
+        for c in range(50):
             if await self.get_status() & STATUS_OSCILLATOR_STABLE:
                 break
         else:
@@ -342,8 +347,8 @@ class CCDPIInterface:
         return (id, rev)
 
     async def chip_erase(self):
-        id,rev = await self._send_recv(OP_COMMAND, [CMD_CHIP_ERASE], 1)
-        for c in range(1000): # XXX pooma
+        await self._send_recv(OP_COMMAND, [CMD_CHIP_ERASE], 1)
+        for c in range(50):
             if await self.get_status() & STATUS_CHIP_ERASE_DONE:
                 break
         else:
@@ -394,18 +399,17 @@ class CCDPIInterface:
     async def read_code(self, linear_address, count):
         """Read from CODE address space.
         """
-		if (linear_address // 0x8000) != ((linear_address+count-1) // 0x8000):
-			raise CCDPIError("reading across a bank boundary")
-		
-		if linear_address < 0x8000:
-			bank = 0
-			address = linear_address
-		else:
-			# CC2430 banking
-			bank = linear_address // 0x8000
-			address = (linear_address % 0x8000) + 0x8000
-			
-        # xxx move the guts of this into target state machine
+        if (linear_address // 0x8000) != ((linear_address+count-1) // 0x8000):
+            raise CCDPIError("reading across a bank boundary")
+        
+        if linear_address < 0x8000:
+            bank = 0
+            address = linear_address
+        else:
+            # CC2430 banking
+            bank = linear_address // 0x8000
+            address = (linear_address % 0x8000) + 0x8000
+            
         data = bytearray()
         await self.debug_instr(0x75, 0xC7, (bank * 16) + 1)                 # MOV MEMCTR, (bank * 16) + 1
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
@@ -418,7 +422,6 @@ class CCDPIInterface:
     async def read_xdata(self, address, count):
         """Read from XDATA address space.
         """
-        # xxx move the guts of this into target state machine
         data = bytearray()
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
         for n in range(count):
@@ -429,10 +432,9 @@ class CCDPIInterface:
     async def write_xdata(self, address, data):
         """Write to XDATA address space.
         """
-        # xxx move the guts of this into target state machine
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
         for b in data:
-            await self.debug_instr(0x74, b)                                 #   MOV A,#byte
+            await self.debug_instr(0x74, b)                                 #   MOV A,#imm8
             await self.debug_instr(0xF0)                                    #   MOV @DPTR,A
             await self.debug_instr(0xA3)                                    #   INC DPTR
 
@@ -442,59 +444,99 @@ class CCDPIInterface:
             clkcon = 0xc1
         else:
             clkcon = 0x80
-
+	
         await self.debug_instr(0x75, 0xC6, clkcon)                          # MOV CLKCON,#0
-        for w in range(10):
-            s = await self.debug_instr(0xE5, 0xBE)                          #   MOV A, SLEEP
-            if s & 0x40:
+        for c in range(50):
+            if (await self.debug_instr(0xE5, 0xBE)) & 0x40:                 #   MOV A, SLEEP
                 break
         else:
             raise CCDPIError("High speed clock not stable")
 
-    async def write_flash_page(address, data, erase=False):
-		# XXX 2430 set unified code
-        # XXX flash timer register
+    async def erase_flash_page(self, address):
+        """Erase one page of flash memory."""
 		
-		words_per_flash_page = self.flash_page_size // self.flash_word_size
+        if (address % self.flash_page_size) != 0:
+            raise CCDPIError("Address is not page aligned")
 
-		if len(data) > self.flash_page_size:
-			raise CCDPIError("More than a page of data")
+        word_address = address // self.flash_word_size
+        
+        await self.debug_instr(0x75, 0xAD, (word_address >> 8) & 0x7f)      # MOV FADDRH, #imm8
+        await self.debug_instr(0x75, 0xAC, 0)                               # MOV FADDRH, #0
+        await self.debug_instr(0x75, 0xAE, 0x01)                            # MOV FLC, #01h ; ERASE
+        for c in range(50):
+            if not ((await self.debug_instr(0xE5, 0xAE)) & 0x80):           # MOV A, FLC
+                break
+        else:
+            raise CCDPIError("Cannot erase flash page") 
 
-		if (address % self.flash_page_size) != 0:
-			raise CCDPIError("Address is not page aligned")
-		
-		
-        routine = [
-            0x75, 0xAD, ((address >> 8) // self.flash_word_size) & 0x7E,    # MOV FADDRH, #imm
-            0x75, 0xAC, 0x00,                                               # MOV FADDRL, #00
+    async def write_flash(self, address, data):
+        """Write up to a page of data to flash memory.
+        Expects flash to be erased already.
+        Pads data with 0xFF so that writes can be to byte boundaries.
+        """
+        # Word align start and end of data by padding with 0xff
+        start_pad = address % self.flash_word_size
+        if start_pad != 0:
+            data = [0xff]*start_pad + data
+            address -= start_pad
+
+        end_pad = len(data) % self.flash_word_size
+        if end_pad != 0:
+            data =  data + [0xff]*(self.flash_word_size-end_pad)
+
+        if len(data) > self.flash_page_size:
+            raise CCDPIError("Trying to write more than a page of data to flash.")
+
+        if len(data) == 0:
+            return
+
+        # Copy data into SRAM at 0xf000
+        data_address = 0xf000
+        await self.write_xdata(data_address, data)
+
+        words_per_flash_page = self.flash_page_size // self.flash_word_size
+        word_address = address // self.flash_word_size
+        word_length = len(data) // self.flash_word_size
+
+        # Counters for nested DJNZ loop
+        count_l = word_length & 0xff
+        count_h = ((word_length >> 8) & 0xff) + (1 if count_l != 0 else 0)
+
+        # Code to run from RAM
+        code = [
+            0x75, 0xAD, (word_address >> 8) & 0x7f,                         #    MOV FADDRH, #imm8
+            0x75, 0xAC, word_address & 0xff,                                #    MOV FADDRL, #imm8
+            0x90, (data_address >> 8) & 0xff, data_address & 0xff,          #    MOV DPTR, #imm16
+            0x7F, count_h,                                                  #    MOV R7, #imm8
+            0x7E, count_l,                                                  #    MOV R6, #imm8
+            0x75, 0xAE, 0x02,                                               #    MOV FLC, #02H ; WRITE
+            0x7D, self.flash_word_size,                                     # 1$: MOV R5, #imm8
+            0xE0,                                                           # 2$:  MOVX A, @DPTR
+            0xA3,                                                           #      INC DPTR
+            0xF5, 0xAF,                                                     #      MOV FWDATA, A
+            0xDD, 0xFA,                                                     #      DJNZ R5, 2$
+            0xE5, 0xAE,                                                     # 3$:   MOV A, FLC
+            0x20, 0XE6, 0xFB,                                               #       JB ACC_SWBSY, 3$
+            0xDE, 0xF1,                                                     #     DJNZ R6, 1$
+            0xDF, 0xEF,                                                     #    DJNZ R7, 1$
+            0xA5                                                            #    HALT
         ]
-        if erase:
-            routine += [
-                0x75, 0xAE, 0x01,                                           # MOV FLC, #01H ; ERASE
-                                                                            # ; Wait for flash erase to complete
-                0xE5, 0xAE,                                                 # eraseWaitLoop: MOV A, FLC
-                0x20, 0xE7, 0xFB,                                           #   JB ACC_BUSY, eraseWaitLoop
-            ]
 
-        routine += [
-                                                                            # ; Initialize the data pointer
-            0x90, 0xF0, 0x00,                                               # MOV DPTR, #0F000H
-                                                                            # ; Outer loop
-            0x7F, (words_per_flash_page >> 8) & 0xff,                       # MOV R7, #imm
-            0x7E, 0x00,                                                     # MOV R6, #0
-            0x75, 0xAE, 0x02,                                               # MOV FLC, #02H ; WRITE
-                                                                            # ; Inner loops
-            0x7D, flash_word_size,                                          # writeLoop: MOV R5, #imm
-            0xE0,                                                           #   writeWordLoop: MOVX A, @DPTR
-            0xA3,                                                           #     INC DPTR
-            0xF5, 0xAF,                                                     #     MOV FWDATA, A
-            0xDD, 0xFA,                                                     #     DJNZ R5, writeWordLoop
-                                                                            #   ; Wait for completion
-            0xE5, 0xAE,                                                     #   writeWaitLoop: MOV A, FLC
-            0x20, 0XE6, 0xFB,                                               #   JB ACC_SWBSY, writeWaitLoop
-            0xDE, 0xF1,                                                     # DJNZ R6, writeLoop
-            0xDF, 0xEF,                                                     # DJNZ R7, writeLoop
-            0xA5                                                            # BREAK
-        ]
+        # Copy code into SRAM in next page
+        code_address = 0xf000 + self.flash_page_size
+        await self.write_xdata(code_address, code)
 
-        # 
+        # Start CPU - then wait for it to halt
+        await self.set_pc(code_address)
+        await self.resume()
+
+        for c in range(50):
+            if (await self.get_status()) & STATUS_CPU_HALTED:
+                break
+        else:
+            raise CCDPIError("Flash code not finished")
+
+        ## Read back DPTR and see how much it moved
+        #dptr_l = await self.debug_instr(0xE5, 0x82)                               # MOV AF,DPL0
+        #dptr_h = await self.debug_instr(0xE5, 0x83)                               # MOV AF,DPH0
+        #return (dptr_h << 8) + dptr_l - data_address

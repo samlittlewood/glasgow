@@ -6,6 +6,7 @@ import asyncio
 import math
 
 from ... import *
+from fx2.format import autodetect, input_data, output_data, flatten_data
 
 from .ccdpi import CCDPISubtarget, CCDPIInterface, DEVICES
 
@@ -130,8 +131,10 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
                     await chipcon_iface.read_code(range(device.program_size)))
 
         if args.operation == "write":
-            self.logger.info("erasing chip")
-            await chipcon_iface.chip_erase()
+            await chipcon_iface.connect()
+
+#            self.logger.info("erasing chip")
+#            await chipcon_iface.chip_erase()
 
             self._check_format(args.file, "flash")
             data = input_data(args.file)
@@ -139,11 +142,12 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
                              sum([len(chunk) for address, chunk in data]))
             for address, chunk in data:
                 chunk = bytes(chunk)
-                await chipcon_iface.write_flash_memory_range(address, chunk, device.program_page)
-                written = await avr_iface.read_flash_memory_range(range(address, len(chunk)))
-                if written != chunk:
-                    raise GlasgowAppletError("verification failed at address %#06x: %s != %s" %
-                                             (address, written.hex(), chunk.hex()))
+                print(address, chunk)
+#                await chipcon_iface.write_flash_memory_range(address, chunk, device.program_page)
+#                written = await avr_iface.read_flash_memory_range(range(address, len(chunk)))
+#                if written != chunk:
+#                    raise GlasgowAppletError("verification failed at address %#06x: %s != %s" %
+#                                             (address, written.hex(), chunk.hex()))
     
         if args.operation == "read-lock":
             pass
@@ -158,6 +162,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
                 name = DEVICES[id]["name"]
             else:
                 name = "Unknown"
+            # XXX test SRAM to figure out F8/F16/F32 parts
             print("Id:{:X} [{}] Rev:{:d}".format(id, name, rev))
 
 # -------------------------------------------------------------------------------------------------
