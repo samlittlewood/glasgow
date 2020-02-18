@@ -6,27 +6,30 @@
 #
 # TBD: CC2530/1/3, CC2540/1
 #
+# XXX move the guts of read/write loops into target state machine
+# XXX flash timer register (FTW)  - setup in clock_init()
+# XXX f8 parts - write half page at a time
+# XXX cc2430: set unified code map
 # XXX implement precise delay in target
-# XXX  move the guts of read/write loops into target state machine
-# XXX flash timer register - setup in clock_init()
-# XXX F8 parts - half page at a time
-# XXX CC2430: set unified code map
 # 
 import logging
 import asyncio
+from collections import namedtuple
 
 from nmigen import *
 from ... import GlasgowAppletError
 
-from fx2.format import autodetect, input_data, output_data, flatten_data
+# Index of known devices
+#
+CCDPIDevice = namedtuple("CCDevice", ["name", "flash_word_size", "flash_page_size",])
 
 DEVICES = {
-    0x01: {"name":"CC1110", "flash_word_size":2, "flash_page_size":1024},
-    0x11: {"name":"CC1111", "flash_word_size":2, "flash_page_size":1024},
-    0x81: {"name":"CC2510", "flash_word_size":2, "flash_page_size":1024},
-    0x91: {"name":"CC2511", "flash_word_size":2, "flash_page_size":1024},
-    0x85: {"name":"CC2430", "flash_word_size":4, "flash_page_size":2048},
-    0x89: {"name":"CC2431", "flash_word_size":4, "flash_page_size":2048},
+    0x01: CCDPIDevice(name="CC1110", flash_word_size=2, flash_page_size=1024),
+    0x11: CCDPIDevice(name="CC1111", flash_word_size=2, flash_page_size=1024),
+    0x81: CCDPIDevice(name="CC2510", flash_word_size=2, flash_page_size=1024),
+    0x91: CCDPIDevice(name="CC2511", flash_word_size=2, flash_page_size=1024),
+    0x85: CCDPIDevice(name="CC2430", flash_word_size=4, flash_page_size=2048),
+    0x89: CCDPIDevice(name="CC2431", flash_word_size=4, flash_page_size=2048),
 }
 
 class CCDPIError(GlasgowAppletError):
@@ -82,7 +85,7 @@ class CCDPIBus(Elaboratable):
 
         m.d.comb += self.di.eq(d)
         
-        with m.FSM(reset='READY') as fsm:
+        with m.FSM():
             with m.State("READY"):
                 m.d.comb += [
                     self.rdy.eq(1),
@@ -205,7 +208,6 @@ class CCDPISubtarget(Elaboratable):
         count_in = Signal(3)
         
         led_ready = platform.request("led",1)
-        led_busy = platform.request("led",2)
 
         with m.FSM():
             with m.State("READY"):
@@ -242,7 +244,7 @@ class CCDPISubtarget(Elaboratable):
                     
             with m.State("IN"):
                 with m.If(count_in == 0):
-                    m.next = "DONE"
+                    m.next = "READY"
                 with m.Elif(bus.rdy):
                     m.d.comb += [
                         bus.w.eq(0),
@@ -272,9 +274,6 @@ class CCDPISubtarget(Elaboratable):
                     ]
                     m.next = "READY"
                     
-            with m.State("DONE"):
-                m.next = "READY"
-
         return m
 
 class CCDPIInterface:
@@ -316,10 +315,8 @@ class CCDPIInterface:
 
         # Is there something recognizable attached?
         self.chip_id,self.chip_rev = await self.get_chip_id()
-        if self.chip_id in DEVICES:
-            self.flash_word_size = DEVICES[self.chip_id]["flash_word_size"]
-            self.flash_page_size = DEVICES[self.chip_id]["flash_page_size"]
-        else:
+        self.device =  DEVICES.get(self.chip_id, None)
+        if not self.device:
             raise CCDPIError("Did not find device")
 
         # Wait for stable clock
@@ -445,9 +442,9 @@ class CCDPIInterface:
         else:
             clkcon = 0x80
 	
-        await self.debug_instr(0x75, 0xC6, clkcon)                          # MOV CLKCON,#0
+        await self.debug_instr(0x75, 0xC6, clkcon)                          # MOV CLKCON,#imm8
         for c in range(50):
-            if (await self.debug_instr(0xE5, 0xBE)) & 0x40:                 #   MOV A, SLEEP
+            if await self.debug_instr(0xE5, 0xBE) & 0x40:                   #   MOV A, SLEEP
                 break
         else:
             raise CCDPIError("High speed clock not stable")
@@ -455,16 +452,16 @@ class CCDPIInterface:
     async def erase_flash_page(self, address):
         """Erase one page of flash memory."""
 		
-        if (address % self.flash_page_size) != 0:
+        if (address % self.device.flash_page_size) != 0:
             raise CCDPIError("Address is not page aligned")
 
-        word_address = address // self.flash_word_size
+        word_address = address // self.device.flash_word_size
         
         await self.debug_instr(0x75, 0xAD, (word_address >> 8) & 0x7f)      # MOV FADDRH, #imm8
         await self.debug_instr(0x75, 0xAC, 0)                               # MOV FADDRH, #0
         await self.debug_instr(0x75, 0xAE, 0x01)                            # MOV FLC, #01h ; ERASE
         for c in range(50):
-            if not ((await self.debug_instr(0xE5, 0xAE)) & 0x80):           # MOV A, FLC
+            if not await self.debug_instr(0xE5, 0xAE) & 0x80:               # MOV A, FLC
                 break
         else:
             raise CCDPIError("Cannot erase flash page") 
@@ -475,28 +472,28 @@ class CCDPIInterface:
         Pads data with 0xFF so that writes can be to byte boundaries.
         """
         # Word align start and end of data by padding with 0xff
-        start_pad = address % self.flash_word_size
+        start_pad = address % self.device.flash_word_size
         if start_pad != 0:
             data = [0xff]*start_pad + data
             address -= start_pad
 
-        end_pad = len(data) % self.flash_word_size
+        end_pad = len(data) % self.device.flash_word_size
         if end_pad != 0:
-            data =  data + [0xff]*(self.flash_word_size-end_pad)
+            data =  data + [0xff]*(self.device.flash_word_size-end_pad)
 
-        if len(data) > self.flash_page_size:
+        if len(data) > self.device.flash_page_size:
             raise CCDPIError("Trying to write more than a page of data to flash.")
 
-        if len(data) == 0:
+        if not data:
             return
 
         # Copy data into SRAM at 0xf000
         data_address = 0xf000
         await self.write_xdata(data_address, data)
 
-        words_per_flash_page = self.flash_page_size // self.flash_word_size
-        word_address = address // self.flash_word_size
-        word_length = len(data) // self.flash_word_size
+        words_per_flash_page = self.device.flash_page_size // self.device.flash_word_size
+        word_address = address // self.device.flash_word_size
+        word_length = len(data) // self.device.flash_word_size
 
         # Counters for nested DJNZ loop
         count_l = word_length & 0xff
@@ -510,7 +507,7 @@ class CCDPIInterface:
             0x7F, count_h,                                                  #    MOV R7, #imm8
             0x7E, count_l,                                                  #    MOV R6, #imm8
             0x75, 0xAE, 0x02,                                               #    MOV FLC, #02H ; WRITE
-            0x7D, self.flash_word_size,                                     # 1$: MOV R5, #imm8
+            0x7D, self.device.flash_word_size,                              # 1$: MOV R5, #imm8
             0xE0,                                                           # 2$:  MOVX A, @DPTR
             0xA3,                                                           #      INC DPTR
             0xF5, 0xAF,                                                     #      MOV FWDATA, A
@@ -523,7 +520,7 @@ class CCDPIInterface:
         ]
 
         # Copy code into SRAM in next page
-        code_address = 0xf000 + self.flash_page_size
+        code_address = 0xf000 + self.device.flash_page_size
         await self.write_xdata(code_address, code)
 
         # Start CPU - then wait for it to halt
@@ -531,12 +528,7 @@ class CCDPIInterface:
         await self.resume()
 
         for c in range(50):
-            if (await self.get_status()) & STATUS_CPU_HALTED:
+            if await self.get_status() & STATUS_CPU_HALTED:
                 break
         else:
             raise CCDPIError("Flash code not finished")
-
-        ## Read back DPTR and see how much it moved
-        #dptr_l = await self.debug_instr(0xE5, 0x82)                               # MOV AF,DPL0
-        #dptr_h = await self.debug_instr(0xE5, 0x83)                               # MOV AF,DPH0
-        #return (dptr_h << 8) + dptr_l - data_address
