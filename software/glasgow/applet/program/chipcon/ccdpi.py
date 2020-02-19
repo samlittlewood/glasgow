@@ -13,7 +13,7 @@
 # XXX f8 parts - write half page at a time
 # XXX cc2430: set unified code map
 # XXX implement precise delay in target
-# 
+#
 import logging
 import asyncio
 from collections import namedtuple
@@ -43,7 +43,7 @@ class CCDPIBus(Elaboratable):
     def __init__(self, pads, period):
         self.pads = pads
         self.half_period = period//2
-        
+
         self.di  = Signal(8)
         self.do  = Signal(8)
         self.bits = Signal(range(8))
@@ -60,7 +60,7 @@ class CCDPIBus(Elaboratable):
         i    = Signal()
 
         led_ready = platform.request("led",0)
-        
+
         m.d.comb += [
             self.pads.dclk_t.oe.eq(1),
             self.pads.dclk_t.o.eq(dclk),
@@ -81,20 +81,20 @@ class CCDPIBus(Elaboratable):
             m.d.sync += timer.eq(timer - 1),
 
         m.d.comb += stb.eq(timer == 0)
-        
+
         d   = Signal(8)
         cnt = Signal(range(8))
 
         m.d.comb += self.di.eq(d)
-        
+
         with m.FSM():
             with m.State("READY"):
                 m.d.comb += [
                     self.rdy.eq(1),
                     led_ready.eq(1),
                 ]
-                
-                with m.If(self.ack): 
+
+                with m.If(self.ack):
                     m.d.sync += cnt.eq(self.bits)
                     with m.If(self.w):
                         m.d.sync += d.eq(self.do)
@@ -123,7 +123,7 @@ class CCDPIBus(Elaboratable):
                         m.next = "DONE"
                     with m.Else():
                         m.next = "WRITE_RISE"
-                    
+
             with m.State("READ_RISE"):
                 with m.If(stb):
                     m.d.sync += [
@@ -143,17 +143,19 @@ class CCDPIBus(Elaboratable):
                     with m.Else():
                         m.next = "READ_RISE"
 
-                       
+
             with m.State("DONE"):
                 with m.If(stb):
                     m.d.sync += oe.eq(0)
                     m.next = "READY"
-                
+
         return m
 
 # Interface operations
-OP_COMMAND = 0
-OP_DEBUG   = 1
+OP_COMMAND         = 0b00
+OP_DEBUG           = 0b01
+
+DISCARD            = 0b1000_0000
 
 # Device debug commands
 #
@@ -209,7 +211,7 @@ class CCDPISubtarget(Elaboratable):
         op = Signal()
         count_out = Signal(3)
         count_in = Signal(3)
-        
+
         led_ready = platform.request("led",1)
 
         with m.FSM():
@@ -242,7 +244,7 @@ class CCDPISubtarget(Elaboratable):
                     ]
 
                     m.d.sync += count_out.eq(count_out-1)
-                    
+
             with m.State("IN"):
                 with m.If(count_in == 0):
                     m.next = "READY"
@@ -253,7 +255,7 @@ class CCDPISubtarget(Elaboratable):
                         bus.ack.eq(1),
                     ]
                     m.next = "IN_WRITE"
-    
+
             with m.State("IN_WRITE"):
                 with m.If(bus.rdy & self.in_fifo.writable):
                     m.d.comb += [
@@ -263,7 +265,7 @@ class CCDPISubtarget(Elaboratable):
 
                     m.d.sync += count_in.eq(count_in-1)
                     m.next = "IN"
-                    
+
             with m.State("DEBUG"):
                 with m.If(bus.rdy):
                     m.d.comb += [
@@ -274,7 +276,7 @@ class CCDPISubtarget(Elaboratable):
                         bus.ack.eq(1),
                     ]
                     m.next = "READY"
-                    
+
         return m
 
 class CCDPIInterface:
@@ -287,22 +289,38 @@ class CCDPIInterface:
         self.connected = False
         self.chip_id = 0
         self.chip_rev = 0
-        
+
     def _log(self, message, *args):
         self._logger.log(self._level, "CCDPI: " + message, *args)
 
-    async def _send_recv(self, op, out_bytes, num_bytes_in, discard=False):
+    async def _send(self, op, out_bytes, num_bytes_in, discard=False):
         """Send operation code then output bytes to fifo.
-        Read back input bytes.
-        TBD: disard is ignored atm
         """
         if not self.connected:
             raise CCDPIError("not connected")
-            
-        start_code = (op << 6) + (len(out_bytes) << 3) + num_bytes_in;
+
+        start_code = (DISCARD if discard else 0) + \
+                     (op << 6) + (len(out_bytes) << 3) + num_bytes_in
+
         await self.lower.write([start_code] + out_bytes)
+
+    async def _recv(self, num_bytes_in):
+        """Read back input bytes.
+        """
+        if not self.connected:
+            raise CCDPIError("not connected")
+
         return await self.lower.read(num_bytes_in)
-    
+
+    async def _flush(self):
+        await self.lower.flush()
+
+    async def _send_recv(self, op, out_bytes, num_bytes_in, discard=False):
+        await self._send(op, out_bytes, num_bytes_in, discard=discard)
+        if not discard:
+            await self._flush()
+            return await self._recv(num_bytes_in)
+
     async def connect(self):
         """If not already connected, reset device into debug mode."""
         if self.connected:
@@ -315,6 +333,7 @@ class CCDPIInterface:
         await self.lower.device.write_register(self._addr_reset, 1)
         await asyncio.sleep(0.01)
         r = await self._send_recv(OP_DEBUG, [], 0)
+        await self.lower.flush()
         await asyncio.sleep(0.01)
         await self.lower.device.write_register(self._addr_reset, 0)
 
@@ -332,17 +351,18 @@ class CCDPIInterface:
             raise CCDPIError("Oscillator not stable")
 
         await self.halt()
-        
+
     async def disconnect(self):
         """If connected, reset device into normal operation."""
         if not self.connected:
             return
         self.connected = False
-        
+
         await asyncio.sleep(0.01)
         await self.lower.device.write_register(self._addr_reset, 1)
         await asyncio.sleep(0.01)
         await self.lower.device.write_register(self._addr_reset, 0)
+        await self._flush()
 
     async def get_chip_id(self):
         id,rev = await self._send_recv(OP_COMMAND, [CMD_GET_CHIP_ID], 2)
@@ -355,16 +375,16 @@ class CCDPIInterface:
                 break
         else:
             raise CCDPIError("Chip erase not done")
-        
+
     async def get_status(self):
         r = await self._send_recv(OP_COMMAND, [CMD_READ_STATUS], 1)
         return r[0]
 
     async def halt(self):
-        await self._send_recv(OP_COMMAND, [CMD_HALT], 1, discard=True)
-    
+        await self._send_recv(OP_COMMAND, [CMD_HALT], 1)
+
     async def resume(self):
-        await self._send_recv(OP_COMMAND, [CMD_RESUME], 1, discard=True)
+        await self._send_recv(OP_COMMAND, [CMD_RESUME], 1)
 
     async def step(self):
         r = await self._send_recv(OP_COMMAND, [CMD_STEP_INSTR], 1)
@@ -373,21 +393,21 @@ class CCDPIInterface:
     async def get_pc(self):
         r = await self._send_recv(OP_COMMAND, [CMD_GET_PC], 2)
         return (r[0] << 8) + r[1]
-    
+
     async def get_config(self):
         r = await self._send_recv(OP_COMMAND, [CMD_RD_CONFIG], 1)
         return r[0]
 
     async def set_config(self, cfg):
-        await self._send_recv(OP_COMMAND, [CMD_WR_CONFIG, cfg], 1, discard=True)
+        await self._send_recv(OP_COMMAND, [CMD_WR_CONFIG, cfg], 1)
 
     async def set_breakpoint(self, bp, bank, address, enable=True):
         await self._send_recv(OP_COMMAND, [CMD_SET_HW_BRKPNT,
                                            (bp << 4)+(0x4 if enable else 0) + bank,
-                                           (address>>8) & 0xff, address & 0xff], 1, discard=True)
+                                           (address>>8) & 0xff, address & 0xff], 1)
 
     async def clear_breakpoint(self, bp):
-        await self._send_recv(OP_COMMAND, [CMD_SET_HW_BRKPNT, (bp << 4) + 0x00, 0x00, 0x00], 1, discard=True)
+        await self._send_recv(OP_COMMAND, [CMD_SET_HW_BRKPNT, (bp << 4) + 0x00, 0x00, 0x00], 1)
 
     async def debug_instr(self, *args):
         if not 1 <= len(args) <= 3:
@@ -399,7 +419,7 @@ class CCDPIInterface:
             raise CCDPIError("Instructions must be 1..3 bytes")
         r = await self._send_recv(OP_COMMAND, [CMD_DEBUG_INSTR + len(args)] + list(args), 1)
         return r[0]
-    
+
     async def set_pc(self, address):
         await self.debug_instr(0x02, (address >> 8) & 0xff, address & 0xff) # LJMP address
 
@@ -408,7 +428,7 @@ class CCDPIInterface:
         """
         if (linear_address // 0x8000) != ((linear_address+count-1) // 0x8000):
             raise CCDPIError("reading across a bank boundary")
-        
+
         if linear_address < 0x8000:
             bank = 0
             address = linear_address
@@ -416,7 +436,7 @@ class CCDPIInterface:
             # CC2430 banking
             bank = linear_address // 0x8000
             address = (linear_address % 0x8000) + 0x8000
-            
+
         data = bytearray()
         await self.debug_instr(0x75, 0xC7, (bank * 16) + 1)                 # MOV MEMCTR, (bank * 16) + 1
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
@@ -424,8 +444,9 @@ class CCDPIInterface:
             await self.debug_instr(0xE4)                                    #   CLR A
             data.append(await self.debug_instr_a(0x93))                     #   MOVC A, @A+DPTR
             await self.debug_instr(0xA3)                                    #   INC DPTR
+        await self._flush()
         return data
-    
+
     async def read_xdata(self, address, count):
         """Read from XDATA address space.
         """
@@ -434,6 +455,7 @@ class CCDPIInterface:
         for n in range(count):
             data.append(await self.debug_instr_a(0xE0))                     #   MOVX A, @DPTR
             await self.debug_instr(0xA3)                                    #   INC DPTR
+        await self._flush()
         return data
 
     async def write_xdata(self, address, data):
@@ -444,6 +466,7 @@ class CCDPIInterface:
             await self.debug_instr(0x74, b)                                 #   MOV A,#imm8
             await self.debug_instr(0xF0)                                    #   MOV @DPTR,A
             await self.debug_instr(0xA3)                                    #   INC DPTR
+        await self._flush()
 
     async def clock_init(self, internal=False):
         """Set up high speed clock (24Mhz Xtal or 12Mhz internal RC). """
@@ -451,7 +474,7 @@ class CCDPIInterface:
             clkcon = 0xc1
         else:
             clkcon = 0x80
-    
+
         await self.debug_instr(0x75, 0xC6, clkcon)                          # MOV CLKCON,#imm8
         for c in range(50):
             if await self.debug_instr_a(0xE5, 0xBE) & 0x40:                 #   MOV A, SLEEP
@@ -461,20 +484,20 @@ class CCDPIInterface:
 
     async def erase_flash_page(self, address):
         """Erase one page of flash memory."""
-        
+
         if (address % self.device.flash_page_size) != 0:
             raise CCDPIError("Address is not page aligned")
 
         word_address = address // self.device.flash_word_size
-        
+
         await self.debug_instr(0x75, 0xAD, (word_address >> 8) & 0x7f)      # MOV FADDRH, #imm8
         await self.debug_instr(0x75, 0xAC, 0)                               # MOV FADDRH, #0
         await self.debug_instr(0x75, 0xAE, 0x01)                            # MOV FLC, #01h ; ERASE
         for c in range(50):
-            if not await self.debug_instr_r(0xE5, 0xAE) & 0x80:               # MOV A, FLC
+            if not await self.debug_instr_a(0xE5, 0xAE) & 0x80:             # MOV A, FLC
                 break
         else:
-            raise CCDPIError("Cannot erase flash page") 
+            raise CCDPIError("Cannot erase flash page")
 
     async def write_flash(self, address, data):
         """Write up to a page of data to flash memory.

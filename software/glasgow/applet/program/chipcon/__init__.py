@@ -44,9 +44,9 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
 
         for pin in cls.__pins:
             access.add_pin_argument(parser, pin, default=True)
-        
+
         parser.add_argument(
-            "-f", "--frequency", metavar="FREQ", type=int, default=100,
+            "-f", "--frequency", metavar="FREQ", type=int, default=1000,
             help="set bit rate to FREQ kHz (default: %(default)s)")
 
     def build(self, target, args):
@@ -79,7 +79,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
 
         def length(arg):
             return int(arg, 0)
-        
+
         p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION")
 
         p_identify = p_operation.add_parser(
@@ -144,7 +144,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
 
         await chipcon_iface.connect()
         await chipcon_iface.clock_init()
-        
+
         self.logger.info("connected to {} Rev:{}".format(
 			chipcon_iface.device.name,
 			chipcon_iface.chip_rev))
@@ -159,13 +159,13 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
 
         elif args.operation == "status":
             await self.report_status(chipcon_iface)
-            
+
         elif args.operation == "erase":
             await chipcon_iface.chip_erase()
-            
+
         elif args.operation == "erase-page":
             await chipcon_iface.erase_flash_page(args,address)
-            
+
         elif args.operation == "read":
             if args.code:
                 self._check_format(args.code, "code")
@@ -180,7 +180,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
                 output_data(args.lock_bits,
                             await chipcon_iface.read_code(args.address, args.length))
                 await chipcon_iface.set_config(0)
-                            
+
         elif args.operation == "write":
             if not args.no_erase:
                 self.logger.info("erasing chip")
