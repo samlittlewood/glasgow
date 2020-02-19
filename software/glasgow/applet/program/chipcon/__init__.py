@@ -6,7 +6,7 @@ import asyncio
 import math
 
 from fx2.format import autodetect, input_data, output_data, flatten_data
-from ... import GlasgowApplet, GlasgowAppletTestCase, synthesis_test
+from ... import GlasgowApplet
 from .ccdpi import CCDPISubtarget, CCDPIInterface, CCDPIError, DEVICES, CONFIG_SEL_FLASH_INFO_PAGE
 
 STATUS_BITS = [
@@ -134,30 +134,27 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
         except ValueError:
             raise CCDPIError("cannot determine %s file format" % kind)
 
-    async def report_status(self, chipcon_iface):
-        s = await chipcon_iface.get_status()
-        ss = list(x for i,x in enumerate(STATUS_BITS) if ((0x80 >> i) & s) != 0)
-        self.logger.info("Status: 0x{:02x} [{}]".format(s, ", ".join(ss)))
-
     async def interact(self, device, args, chipcon_iface):
 
         await chipcon_iface.connect()
         await chipcon_iface.clock_init()
 
         self.logger.info("connected to {} Rev:{}".format(
-			chipcon_iface.device.name,
-			chipcon_iface.chip_rev))
+            chipcon_iface.device.name,
+            chipcon_iface.chip_rev))
         self.logger.info(args.operation)
 
         if args.operation == "identify":
             # XXX test SRAM to figure out F8/F16/F32 parts
             self.logger.info("Id:{:X} [{}] Rev:{:d}".format(
-				chipcon_iface.chip_id,
-				chipcon_iface.device.name,
-				chipcon_iface.chip_rev))
+                chipcon_iface.chip_id,
+                chipcon_iface.device.name,
+                chipcon_iface.chip_rev))
 
         elif args.operation == "status":
-            await self.report_status(chipcon_iface)
+            s = await chipcon_iface.get_status()
+            ss = list(x for i,x in enumerate(STATUS_BITS) if ((0x80 >> i) & s) != 0)
+            self.logger.info("Status: 0x{:02x} [{}]".format(s, ", ".join(ss)))
 
         elif args.operation == "erase":
             await chipcon_iface.chip_erase()
@@ -169,6 +166,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
             if args.code:
                 self._check_format(args.code, "code")
                 self.logger.info("reading code (%d bytes)", args.length)
+                await chipcon_iface.set_config(0)
                 output_data(args.code,
                             await chipcon_iface.read_code(args.address, args.length))
 
@@ -190,15 +188,9 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
                 data = input_data(args.code)
                 self.logger.info("writing code (%d bytes)",
                                  sum([len(chunk) for address, chunk in data]))
-                for address, chunk in data:
-                    chunk = bytes(chunk)
-                    await chipcon_iface.write_flash(address, chunk)
-                    readback = await chipcon_iface.read_code(address, len(chunk))
-
-                    if chunk != readback:
-                        raise CCDPIError(
-                            "verification failed at address %#06x: %s != %s" %
-                            (address, readback.hex(), chunk.hex()))
+                await chipcon_iface.set_config(0)
+                await self._write_flash_blocks(chipcon_iface, data,
+                                               chipcon_iface.device.write_block_size)
 
             if args.lock_bits:
                 self._check_format(args.lock_bits, "lock-bits")
@@ -207,20 +199,28 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
                                  sum([len(chunk) for address, chunk in data]))
 
                 await chipcon_iface.set_config(CONFIG_SEL_FLASH_INFO_PAGE)
-                for address, chunk in data:
-                    chunk = bytes(chunk)
-                    await chipcon_iface.write_flash(address + args.offset, chunk)
-                    readback = await chipcon_iface.read_code(address + args.offset, len(chunk))
-
-                    if chunk != readback:
-                        raise CCDPIError(
-                            "verification failed at address %#06x: %s != %s" %
-                            (address, readback.hex(), chunk.hex()))
+                await self._write_flash_blocks(chipcon_iface, data,
+                                               chipcon_iface.device.write_block_size)
                 await chipcon_iface.set_config(0)
 
         await chipcon_iface.disconnect()
 
+    async def _write_flash_blocks(self, chipcon_iface, data, block_size):
+        """Write data to flash, breaking into blocks of given size."""
+
+        for address, chunk in data:
+            for o in range(0, len(chunk), block_size):
+                block = bytes(chunk[o:o+block_size])
+                await chipcon_iface.write_flash(address+o, block)
+                readback = await chipcon_iface.read_code(address+o, len(block))
+
+                if block != readback:
+                    raise CCDPIError("verification failed at address %#06x: %s != %s" %
+                                     (address, readback.hex(), chunk.hex()))
+
+
 # -------------------------------------------------------------------------------------------------
+from ... import GlasgowAppletTestCase, synthesis_test
 
 class ProgramChipconAppletTestCase(GlasgowAppletTestCase, applet=ProgramChipconApplet):
     @synthesis_test

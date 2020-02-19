@@ -8,10 +8,9 @@
 #
 # Tested: CC2511F32 rev. 3
 #
-# XXX move the guts of read/write loops into target state machine
-# XXX flash timer register (FTW)  - setup in clock_init()
+# XXX flash timer register (FTW) - setup in clock_init()
 # XXX f8 parts - write half page at a time
-# XXX cc2430: set unified code map
+# XXX cc2430: set unified code map?
 # XXX implement precise delay in target
 #
 import logging
@@ -23,15 +22,15 @@ from ... import GlasgowAppletError
 
 # Index of known devices
 #
-CCDPIDevice = namedtuple("CCDevice", ["name", "flash_word_size", "flash_page_size",])
+CCDPIDevice = namedtuple("CCDevice", ["name", "flash_word_size", "flash_page_size", "write_block_size"])
 
 DEVICES = {
-    0x01: CCDPIDevice(name="CC1110", flash_word_size=2, flash_page_size=1024),
-    0x11: CCDPIDevice(name="CC1111", flash_word_size=2, flash_page_size=1024),
-    0x81: CCDPIDevice(name="CC2510", flash_word_size=2, flash_page_size=1024),
-    0x91: CCDPIDevice(name="CC2511", flash_word_size=2, flash_page_size=1024),
-    0x85: CCDPIDevice(name="CC2430", flash_word_size=4, flash_page_size=2048),
-    0x89: CCDPIDevice(name="CC2431", flash_word_size=4, flash_page_size=2048),
+    0x01: CCDPIDevice(name="CC1110", flash_word_size=2, flash_page_size=1024, write_block_size=1024),
+    0x11: CCDPIDevice(name="CC1111", flash_word_size=2, flash_page_size=1024, write_block_size=1024),
+    0x81: CCDPIDevice(name="CC2510", flash_word_size=2, flash_page_size=1024, write_block_size=1024),
+    0x91: CCDPIDevice(name="CC2511", flash_word_size=2, flash_page_size=1024, write_block_size=1024),
+    0x85: CCDPIDevice(name="CC2430", flash_word_size=4, flash_page_size=2048, write_block_size=2048),
+    0x89: CCDPIDevice(name="CC2431", flash_word_size=4, flash_page_size=2048, write_block_size=2048),
 }
 
 class CCDPIError(GlasgowAppletError):
