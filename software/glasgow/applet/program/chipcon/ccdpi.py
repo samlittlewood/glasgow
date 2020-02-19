@@ -18,7 +18,7 @@ import logging
 import asyncio
 from collections import namedtuple
 
-from nmigen import *
+from nmigen import Elaboratable, Module, Signal, Cat
 from ... import GlasgowAppletError
 
 # Index of known devices
@@ -323,8 +323,6 @@ class CCDPIInterface:
 
     async def connect(self):
         """If not already connected, reset device into debug mode."""
-        if self.connected:
-            return
         self.connected = True
 
         await self.lower.reset()
@@ -353,8 +351,6 @@ class CCDPIInterface:
 
     async def disconnect(self):
         """If connected, reset device into normal operation."""
-        if not self.connected:
-            return
         self.connected = False
 
         await self.lower.device.write_register(self._addr_reset, 1)

@@ -5,10 +5,9 @@ import argparse
 import asyncio
 import math
 
-from ... import *
 from fx2.format import autodetect, input_data, output_data, flatten_data
-
-from .ccdpi import CCDPISubtarget, CCDPIInterface, DEVICES, CONFIG_SEL_FLASH_INFO_PAGE
+from ... import GlasgowApplet, GlasgowAppletTestCase, synthesis_test
+from .ccdpi import CCDPISubtarget, CCDPIInterface, CCDPIError, DEVICES, CONFIG_SEL_FLASH_INFO_PAGE
 
 STATUS_BITS = [
     "CHIP_ERASE_DONE",
@@ -133,7 +132,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
         try:
             autodetect(file)
         except ValueError:
-            raise GlasgowAppletError("cannot determine %s file format" % kind)
+            raise CCDPIError("cannot determine %s file format" % kind)
 
     async def report_status(self, chipcon_iface):
         s = await chipcon_iface.get_status()
@@ -197,9 +196,9 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
                     readback = await chipcon_iface.read_code(address, len(chunk))
 
                     if chunk != readback:
-                        raise GlasgowAppletError(
+                        raise CCDPIError(
                             "verification failed at address %#06x: %s != %s" %
-                            (address, written.hex(), chunk.hex()))
+                            (address, readback.hex(), chunk.hex()))
 
             if args.lock_bits:
                 self._check_format(args.lock_bits, "lock-bits")
@@ -214,7 +213,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
                     readback = await chipcon_iface.read_code(address + args.offset, len(chunk))
 
                     if chunk != readback:
-                        raise GlasgowAppletError(
+                        raise CCDPIError(
                             "verification failed at address %#06x: %s != %s" %
                             (address, readback.hex(), chunk.hex()))
                 await chipcon_iface.set_config(0)
