@@ -154,8 +154,7 @@ class CCDPIBus(Elaboratable):
 # Interface operations
 OP_COMMAND         = 0b00
 OP_DEBUG           = 0b01
-
-DISCARD            = 0b1000_0000
+OP_COMMAND_DISCARD = 0b10
 
 # Device debug commands
 #
@@ -280,6 +279,10 @@ class CCDPISubtarget(Elaboratable):
         return m
 
 class CCDPIInterface:
+
+    # Number of reads that the queued up before reading back
+    READ_CHUNK_SIZE=1024
+
     def __init__(self, interface, logger, addr_reset):
         self.lower   = interface
         self._logger = logger
@@ -293,16 +296,17 @@ class CCDPIInterface:
     def _log(self, message, *args):
         self._logger.log(self._level, "CCDPI: " + message, *args)
 
-    async def _send(self, op, out_bytes, num_bytes_in, discard=False):
+    async def _send(self, op, out_bytes, num_bytes_in):
         """Send operation code then output bytes to fifo.
         """
         if not self.connected:
             raise CCDPIError("not connected")
 
-        start_code = (DISCARD if discard else 0) + \
-                     (op << 6) + (len(out_bytes) << 3) + num_bytes_in
-
+        start_code = (op << 6) + (len(out_bytes) << 3) + num_bytes_in
         await self.lower.write([start_code] + out_bytes)
+
+    async def _flush(self):
+        await self.lower.flush()
 
     async def _recv(self, num_bytes_in):
         """Read back input bytes.
@@ -312,14 +316,10 @@ class CCDPIInterface:
 
         return await self.lower.read(num_bytes_in)
 
-    async def _flush(self):
-        await self.lower.flush()
-
-    async def _send_recv(self, op, out_bytes, num_bytes_in, discard=False):
-        await self._send(op, out_bytes, num_bytes_in, discard=discard)
-        if not discard:
-            await self._flush()
-            return await self._recv(num_bytes_in)
+    async def _send_recv(self, op, out_bytes, num_bytes_in):
+        await self._send(op, out_bytes, num_bytes_in)
+        await self._flush()
+        return await self._recv(num_bytes_in)
 
     async def connect(self):
         """If not already connected, reset device into debug mode."""
@@ -329,10 +329,9 @@ class CCDPIInterface:
 
         await self.lower.reset()
 
-        await asyncio.sleep(0.01)
         await self.lower.device.write_register(self._addr_reset, 1)
         await asyncio.sleep(0.01)
-        r = await self._send_recv(OP_DEBUG, [], 0)
+        r = await self._send(OP_DEBUG, [], 0)
         await self.lower.flush()
         await asyncio.sleep(0.01)
         await self.lower.device.write_register(self._addr_reset, 0)
@@ -358,7 +357,6 @@ class CCDPIInterface:
             return
         self.connected = False
 
-        await asyncio.sleep(0.01)
         await self.lower.device.write_register(self._addr_reset, 1)
         await asyncio.sleep(0.01)
         await self.lower.device.write_register(self._addr_reset, 0)
@@ -409,10 +407,11 @@ class CCDPIInterface:
     async def clear_breakpoint(self, bp):
         await self._send_recv(OP_COMMAND, [CMD_SET_HW_BRKPNT, (bp << 4) + 0x00, 0x00, 0x00], 1)
 
-    async def debug_instr(self, *args):
+    async def debug_instr(self, *args, discard=True):
         if not 1 <= len(args) <= 3:
             raise CCDPIError("Instructions must be 1..3 bytes")
-        await self._send_recv(OP_COMMAND, [CMD_DEBUG_INSTR + len(args)] + list(args), 1, discard=True)
+        op = OP_COMMAND_DISCARD if discard else OP_COMMAND
+        await self._send(op, [CMD_DEBUG_INSTR + len(args)] + list(args), 1)
 
     async def debug_instr_a(self, *args):
         if not 1 <= len(args) <= 3:
@@ -437,31 +436,50 @@ class CCDPIInterface:
             bank = linear_address // 0x8000
             address = (linear_address % 0x8000) + 0x8000
 
-        data = bytearray()
         await self.debug_instr(0x75, 0xC7, (bank * 16) + 1)                 # MOV MEMCTR, (bank * 16) + 1
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
-        for n in range(count):
-            await self.debug_instr(0xE4)                                    #   CLR A
-            data.append(await self.debug_instr_a(0x93))                     #   MOVC A, @A+DPTR
-            await self.debug_instr(0xA3)                                    #   INC DPTR
-        await self._flush()
+
+        # Read in chunk - send out a burst of read insns, then read back the replies
+        data = bytearray()
+        while count:
+            c = min(self.READ_CHUNK_SIZE, count)
+            count -= c
+            for n in range(c):
+                await self.debug_instr(0xE4)                                    #   CLR A
+                await self.debug_instr(0x93, discard=False)                     #   MOVC A, @A+DPTR
+                await self.debug_instr(0xA3)                                    #   INC DPTR
+
+            await self._flush()
+
+            data += await self._recv(c)
+
         return data
 
     async def read_xdata(self, address, count):
         """Read from XDATA address space.
         """
-        data = bytearray()
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
-        for n in range(count):
-            data.append(await self.debug_instr_a(0xE0))                     #   MOVX A, @DPTR
-            await self.debug_instr(0xA3)                                    #   INC DPTR
-        await self._flush()
+
+        # Read in chunk - send out a burst of read insns, then read back the replies
+        data = bytearray()
+        while count:
+            c = min(self.READ_CHUNK_SIZE, count)
+            count -= c
+            for n in range(c):
+                await self.debug_instr(0xE0, discard=False)                     #   MOVC A, @A+DPTR
+                await self.debug_instr(0xA3)                                    #   INC DPTR
+
+            await self._flush()
+
+            data += await self._recv(c)
+
         return data
 
     async def write_xdata(self, address, data):
         """Write to XDATA address space.
         """
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
+
         for b in data:
             await self.debug_instr(0x74, b)                                 #   MOV A,#imm8
             await self.debug_instr(0xF0)                                    #   MOV @DPTR,A
