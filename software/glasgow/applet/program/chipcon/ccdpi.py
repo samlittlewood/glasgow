@@ -436,8 +436,8 @@ class CCDPIInterface:
             bank = linear_address // 0x8000
             address = (linear_address % 0x8000) + 0x8000
 
-        await self.debug_instr(0x75, 0xC7, (bank * 16) + 1)                 # MOV MEMCTR, (bank * 16) + 1
-        await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
+        await self.debug_instr(0x75, 0xC7, (bank * 16) + 1)                     # MOV MEMCTR, (bank * 16) + 1
+        await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff)     # MOV DPTR, address
 
         # Read in chunk - send out a burst of read insns, then read back the replies
         data = bytearray()
@@ -458,7 +458,7 @@ class CCDPIInterface:
     async def read_xdata(self, address, count):
         """Read from XDATA address space.
         """
-        await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
+        await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff)     # MOV DPTR, address
 
         # Read in chunk - send out a burst of read insns, then read back the replies
         data = bytearray()
@@ -481,9 +481,9 @@ class CCDPIInterface:
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
 
         for b in data:
-            await self.debug_instr(0x74, b)                                 #   MOV A,#imm8
-            await self.debug_instr(0xF0)                                    #   MOV @DPTR,A
-            await self.debug_instr(0xA3)                                    #   INC DPTR
+            await self.debug_instr(0x74, b)                                     #   MOV A,#imm8
+            await self.debug_instr(0xF0)                                        #   MOV @DPTR,A
+            await self.debug_instr(0xA3)                                        #   INC DPTR
         await self._flush()
 
     async def clock_init(self, internal=False):
@@ -493,9 +493,9 @@ class CCDPIInterface:
         else:
             clkcon = 0x80
 
-        await self.debug_instr(0x75, 0xC6, clkcon)                          # MOV CLKCON,#imm8
+        await self.debug_instr(0x75, 0xC6, clkcon)                              # MOV CLKCON,#imm8
         for c in range(50):
-            if await self.debug_instr_a(0xE5, 0xBE) & 0x40:                 #   MOV A, SLEEP
+            if await self.debug_instr_a(0xE5, 0xBE) & 0x40:                     #   MOV A, SLEEP
                 break
         else:
             raise CCDPIError("High speed clock not stable")
@@ -508,11 +508,11 @@ class CCDPIInterface:
 
         word_address = address // self.device.flash_word_size
 
-        await self.debug_instr(0x75, 0xAD, (word_address >> 8) & 0x7f)      # MOV FADDRH, #imm8
-        await self.debug_instr(0x75, 0xAC, 0)                               # MOV FADDRH, #0
-        await self.debug_instr(0x75, 0xAE, 0x01)                            # MOV FLC, #01h ; ERASE
+        await self.debug_instr(0x75, 0xAD, (word_address >> 8) & 0x7f)          # MOV FADDRH, #imm8
+        await self.debug_instr(0x75, 0xAC, 0)                                   # MOV FADDRH, #0
+        await self.debug_instr(0x75, 0xAE, 0x01)                                # MOV FLC, #01h ; ERASE
         for c in range(50):
-            if not await self.debug_instr_a(0xE5, 0xAE) & 0x80:             # MOV A, FLC
+            if not await self.debug_instr_a(0xE5, 0xAE) & 0x80:                 # MOV A, FLC
                 break
         else:
             raise CCDPIError("Cannot erase flash page")

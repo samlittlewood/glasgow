@@ -8,7 +8,7 @@ import math
 from ... import *
 from fx2.format import autodetect, input_data, output_data, flatten_data
 
-from .ccdpi import CCDPISubtarget, CCDPIInterface, DEVICES
+from .ccdpi import CCDPISubtarget, CCDPIInterface, DEVICES, CONFIG_SEL_FLASH_INFO_PAGE
 
 STATUS_BITS = [
     "CHIP_ERASE_DONE",
@@ -176,7 +176,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
             if args.lock_bits:
                 self._check_format(args.lock_bits, "lock-bits")
                 self.logger.info("reading flash information (%d bytes)", args.length)
-                await chipcon_iface.set_config(1) # CONFIG_SEL_FLASH_INFO_PAGE
+                await chipcon_iface.set_config(CONFIG_SEL_FLASH_INFO_PAGE)
                 output_data(args.lock_bits,
                             await chipcon_iface.read_code(args.address, args.length))
                 await chipcon_iface.set_config(0)
@@ -206,17 +206,18 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
                 data = input_data(args.lock_bits)
                 self.logger.info("writing flash information (%d bytes)",
                                  sum([len(chunk) for address, chunk in data]))
+
+                await chipcon_iface.set_config(CONFIG_SEL_FLASH_INFO_PAGE)
                 for address, chunk in data:
                     chunk = bytes(chunk)
-                    await chipcon_iface.set_config(1) # CONFIG_SEL_FLASH_INFO_PAGE
                     await chipcon_iface.write_flash(address + args.offset, chunk)
                     readback = await chipcon_iface.read_code(address + args.offset, len(chunk))
-                    await chipcon_iface.set_config(0)
 
                     if chunk != readback:
                         raise GlasgowAppletError(
                             "verification failed at address %#06x: %s != %s" %
-                            (address, written.hex(), chunk.hex()))
+                            (address, readback.hex(), chunk.hex()))
+                await chipcon_iface.set_config(0)
 
         await chipcon_iface.disconnect()
 
