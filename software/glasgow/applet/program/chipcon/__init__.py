@@ -24,15 +24,7 @@ class ProgramChipconApplet(GlasgowApplet, name="program-chipcon"):
     logger = logging.getLogger(__name__)
     help = "program TI/Chipcon CC111x CC251x "
     description = """
-    TBD
-
-    CC111-2511DDK P3 Debug:
-
-    1 GND    2 VDD
-    3 DCLK   4 DDAT
-    5        6
-    7 RESETN 8
-    9        10
+    Program and read back TI/Chipcon CC111x, CC251x and CC243x parts.
     """
 
     __pins = ( "dclk", "ddat", "resetn")

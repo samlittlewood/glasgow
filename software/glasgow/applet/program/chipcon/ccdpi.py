@@ -9,9 +9,11 @@
 # Tested: CC2511F32 rev. 3
 #
 # XXX flash timer register (FTW) - setup in clock_init()
-# XXX f8 parts - write half page at a time
+# XXX f8 parts - write half page at a time - not sure how to identify these parts yet
 # XXX cc2430: set unified code map?
 # XXX implement precise delay in target
+#
+# XXX Could add some radio operations to take over more of SmartRF Studio
 #
 import logging
 import asyncio
@@ -279,7 +281,7 @@ class CCDPISubtarget(Elaboratable):
 
 class CCDPIInterface:
 
-    # Number of reads that the queued up before reading back
+    # Number of reads ops that are queued up before pulling data from fifo
     READ_CHUNK_SIZE=1024
 
     def __init__(self, interface, logger, addr_reset):
@@ -296,8 +298,7 @@ class CCDPIInterface:
         self._logger.log(self._level, "CCDPI: " + message, *args)
 
     async def _send(self, op, out_bytes, num_bytes_in):
-        """Send operation code then output bytes to fifo.
-        """
+        """Send operation code then output bytes to fifo."""
         if not self.connected:
             raise CCDPIError("not connected")
 
@@ -305,11 +306,11 @@ class CCDPIInterface:
         await self.lower.write([start_code] + out_bytes)
 
     async def _flush(self):
+        """Flush data down to target."""
         await self.lower.flush()
 
     async def _recv(self, num_bytes_in):
-        """Read back input bytes.
-        """
+        """Read back input bytes."""
         if not self.connected:
             raise CCDPIError("not connected")
 
@@ -321,11 +322,12 @@ class CCDPIInterface:
         return await self._recv(num_bytes_in)
 
     async def connect(self):
-        """If not already connected, reset device into debug mode."""
+        """Reset device into debug mode."""
         self.connected = True
 
         await self.lower.reset()
 
+        # Generate entry signal - two clocks while reset
         await self.lower.device.write_register(self._addr_reset, 1)
         await asyncio.sleep(0.01)
         r = await self._send(OP_DEBUG, [], 0)
@@ -349,7 +351,7 @@ class CCDPIInterface:
         await self.halt()
 
     async def disconnect(self):
-        """If connected, reset device into normal operation."""
+        """Reset device into normal operation."""
         self.connected = False
 
         await self.lower.device.write_register(self._addr_reset, 1)
@@ -418,8 +420,8 @@ class CCDPIInterface:
         await self.debug_instr(0x02, (address >> 8) & 0xff, address & 0xff) # LJMP address
 
     async def read_code(self, linear_address, count):
-        """Read from CODE address space.
-        """
+        """Read from CODE address space."""
+
         if (linear_address // 0x8000) != ((linear_address+count-1) // 0x8000):
             raise CCDPIError("reading across a bank boundary")
 
@@ -451,8 +453,8 @@ class CCDPIInterface:
         return data
 
     async def read_xdata(self, address, count):
-        """Read from XDATA address space.
-        """
+        """Read from XDATA address space."""
+
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff)     # MOV DPTR, address
 
         # Read in chunk - send out a burst of read insns, then read back the replies
@@ -471,8 +473,8 @@ class CCDPIInterface:
         return data
 
     async def write_xdata(self, address, data):
-        """Write to XDATA address space.
-        """
+        """Write to XDATA address space."""
+
         await self.debug_instr(0x90, (address >> 8) & 0xff, address & 0xff) # MOV DPTR, address
 
         for b in data:
@@ -483,6 +485,7 @@ class CCDPIInterface:
 
     async def clock_init(self, internal=False):
         """Set up high speed clock (24Mhz Xtal or 12Mhz internal RC). """
+
         if internal:
             clkcon = 0xc1
         else:
@@ -514,9 +517,11 @@ class CCDPIInterface:
 
     async def write_flash(self, address, data):
         """Write up to a page of data to flash memory.
+
         Expects flash to be erased already.
         Pads data with 0xFF so that writes can be to byte boundaries.
         """
+
         # Word align start and end of data by padding with 0xff
         start_pad = address % self.device.flash_word_size
         if start_pad != 0:
